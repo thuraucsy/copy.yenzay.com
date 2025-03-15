@@ -3,18 +3,35 @@ import { ChatClient, useMessages, usePresenceListener, usePresence } from '@ably
 import { ChatClientProvider, ChatRoomProvider, RoomOptionsDefaults } from '@ably/chat';
 import { useApp } from '../ThemedApp';
 import { useState } from 'react';
+import { FileUploader } from 'react-drag-drop-files';
 
 let localConnection;
 let sendChannel;
 let remoteConnection;
 let receiveChannel;
+let fileReader;
+let receiveBuffer = [];
+let receivedSize = 0;
+let statsInterval = null;
+let timestampStart;
+let bitrateMax = 0;
+let receiveFile;
 
 const RoomComponent = ({ client }) => {
     const [files, setFiles] = useState(null);
+    const [sendProgressMax, setSendProgressMax] = useState(0);
+    const [sendProgressValue, setSendProgressValue] = useState(0);
+    const [receiveProgressMax, setReceiveProgressMax] = useState(0);
+    const [receiveProgressValue, setReceiveProgressValue] = useState(0);
+
+    const [bitRateTextContent, setBitRateTextContent] = useState('');
+    const [anchorHref, setAnchorHref] = useState(null);
+    const [anchorFileName, setAnchorFileName] = useState('');
+    const [anchorTextContent, setAnchorTextContent] = useState('');
 
     const { roomStatus, roomError, send } = useMessages({
         listener: async (message) => {
-            console.log('Received message: ', message);
+            console.log('Received message: ', message.message.text, message.message.metadata, message);
             if (message.message.clientId !== client.clientId) {
                 console.log('getting message from another clientId', message.message.clientId)
 
@@ -44,6 +61,8 @@ const RoomComponent = ({ client }) => {
                         remoteConnection.addEventListener('datachannel', receiveChannelCallback);
                     }
 
+                    console.log('the log must not output from send channel')
+
                     if (message.message.text === 'icecandidate') {
                         await remoteConnection.addIceCandidate(message.message.metadata.data);
                     } else if (message.message.text === 'description') {
@@ -54,24 +73,14 @@ const RoomComponent = ({ client }) => {
                         } catch (e) {
                             console.log('Failed to create session description: ', e);
                         }
+                    } else if (message.message.text === 'file') {
+                        console.log('file', message)
+                        receiveBuffer = [];
+                        receivedSize = 0;
+                        receiveFile = message.message.metadata.data;
                     }
                 }
             }
-            // {
-            //         "type": "message.created",
-            //         "message": {
-            //             "serial": "01741680720256-000@a2dKYkKlgBmlN379316702:000",
-            //             "clientId": "idd1e924dd6dd1f",
-            //             "roomId": "main-room",
-            //             "text": "Hello, World!",
-            //             "metadata": { },
-            //             "headers": { },
-            //             "action": "message.create",
-            //             "version": "01741680720256-000@a2dKYkKlgBmlN379316702:000",
-            //             "createdAt": "2025-03-11T08:12:00.256Z",
-            //             "timestamp": "2025-03-11T08:12:00.256Z"
-            //        }
-            // }
         },
     });
 
@@ -102,19 +111,54 @@ const RoomComponent = ({ client }) => {
     function onReceiveMessageCallback(event) {
         // console.log(`Received Message ${event.data.byteLength} ${receivedSize}`);
         console.log(`Received Message ${event.data.byteLength}`);
+        receiveBuffer.push(event.data);
+        receivedSize += event.data.byteLength;
+        setReceiveProgressValue(receivedSize);
+
+        const file = receiveFile;
+        if (receivedSize === file.size) {
+            const received = new Blob(receiveBuffer);
+            receiveBuffer = [];
+
+            setAnchorHref(URL.createObjectURL(received));
+            setAnchorFileName(file.name);
+            setAnchorTextContent(`Click to download '${file.name}' (${file.size} bytes)`);
+
+            const bitrate = Math.round(receivedSize * 8 / ((new Date()).getTime() - timestampStart));
+            setBitRateTextContent(`Average Bitrate: ${bitrate} kbits/sec (max: ${bitrateMax} kbits/sec)`);
+
+            if (statsInterval) {
+                clearInterval(statsInterval);
+                statsInterval = null;
+            }
+
+            closeDataChannels();
+        }
     }
 
     async function onReceiveChannelStateChange() {
         if (receiveChannel) {
             const readyState = receiveChannel.readyState;
             console.log(`Receive channel state is: ${readyState}`);
-            // if (readyState === 'open') {
-            //     timestampStart = (new Date()).getTime();
-            //     timestampPrev = timestampStart;
-            //     statsInterval = setInterval(displayStats, 500);
-            //     await displayStats();
-            // }
+            if (readyState === 'open') {
+                timestampStart = (new Date()).getTime();
+                timestampPrev = timestampStart;
+                statsInterval = setInterval(displayStats, 500);
+                await displayStats();
+            }
         }
+    }
+
+    function closeDataChannels() {
+        console.log('Closing data channels');
+        if (receiveChannel) {
+            receiveChannel.close();
+            console.log(`Closed data channel with label: ${receiveChannel.label}`);
+            receiveChannel = null;
+        }
+        remoteConnection.close();
+        remoteConnection = null;
+        console.log('Closed peer connections');
     }
 
     return (
@@ -123,12 +167,25 @@ const RoomComponent = ({ client }) => {
             <p>Room error is: {roomError}</p>
 
             <FileComponent setFiles={setFiles} />
-            <PresenceListener client={client} send={send} files={files} />
+            <PresenceListener client={client} send={send} files={files} setSendProgressMax={setSendProgressMax} setReceiveProgressMax={setReceiveProgressMax} />
+
+            <div class="progress">
+                <div class="label">Send progress: </div>
+                <progress id="sendProgress" max={sendProgressMax} value={sendProgressValue}></progress>
+            </div>
+
+            <div class="progress">
+                <div class="label">Receive progress: </div>
+                <progress id="receiveProgress" max={receiveProgressMax} value={receiveProgressValue}></progress>
+            </div>
+
+            <div id="bitrate">{bitRateTextContent}</div>
+            <a id-="download" href={anchorHref} download={anchorFileName}>{anchorTextContent}</a>
         </div>
     );
 };
 
-const PresenceListener = ({ client, send, files }) => {
+const PresenceListener = ({ client, send, files, setSendProgressMax, setReceiveProgressMax }) => {
     const { update, isPresent } = usePresence({
         enterWithData: { status: 'Online' },
     });
@@ -142,15 +199,12 @@ const PresenceListener = ({ client, send, files }) => {
 
         const handleMessageSend = (toClientId) => {
             console.log('client send click', toClientId)
-            // if (!files || files?.length === 0) return;
+            if (!files || files?.length === 0) return;
             // console.log('files', files.length)
             createConnection(toClientId);
         };
 
         async function createConnection(toClientId) {
-            // if (localConnection) {
-            //     closeDataChannels();
-            // }
             console.log('send')
 
             localConnection = new RTCPeerConnection({
@@ -184,71 +238,129 @@ const PresenceListener = ({ client, send, files }) => {
 
             sendChannel = localConnection.createDataChannel('sendDataChannel');
             sendChannel.binaryType = 'arraybuffer';
-            console.log('Created send data channel');
+            console.log('Created send data channel', toClientId);
 
-            sendChannel.addEventListener('open', onSendChannelStateChange);
-            sendChannel.addEventListener('close', onSendChannelStateChange);
+            sendChannel.addEventListener('open', function (e) { onSendChannelStateChange(e, toClientId) });
+            sendChannel.addEventListener('close', function (e) { onSendChannelStateChange(e, toClientId) });
             sendChannel.addEventListener('error', onError);
 
             localConnection.addEventListener('icecandidate', async event => {
                 console.log('Local ICE candidate: ', event.candidate);
 
-                send({ text: 'candidate', metadata: { toClientId, data: event.candidate } });
+                send({ text: 'icecandidate', metadata: { toClientId, data: event.candidate } });
             });
-
-            function onError(error) {
-                if (sendChannel) {
-                    console.error('Error in sendChannel:', error);
-                    return;
-                }
-                console.log('Error in sendChannel which is already closed:', error);
-            }
-
-            async function gotLocalDescription(desc) {
-                await localConnection.setLocalDescription(desc);
-                console.log(`Offer from localConnection\n ${desc.sdp}`);
-
-                send({ text: 'description', metadata: { toClientId, data: desc } });
-            }
 
             try {
                 const offer = await localConnection.createOffer();
-                await gotLocalDescription(offer);
+                await gotLocalDescription(offer, toClientId);
             } catch (e) {
                 console.log('Failed to create session description: ', e);
             }
         }
 
-        function closeDataChannels() {
-            console.log('Closing data channels');
-            sendChannel.close();
-            console.log(`Closed data channel with label: ${sendChannel.label}`);
-            sendChannel = null;
-            if (receiveChannel) {
-                receiveChannel.close();
-                console.log(`Closed data channel with label: ${receiveChannel.label}`);
-                receiveChannel = null;
+        function onError(error) {
+            if (sendChannel) {
+                console.error('Error in sendChannel:', error);
+                return;
             }
-            localConnection.close();
-            remoteConnection.close();
-            localConnection = null;
-            remoteConnection = null;
-            console.log('Closed peer connections');
+            console.log('Error in sendChannel which is already closed:', error);
         }
 
-        function onSendChannelStateChange() {
+        async function gotLocalDescription(desc, toClientId) {
+            await localConnection.setLocalDescription(desc);
+            console.log(`Offer from localConnection\n ${desc.sdp}`);
+
+            send({ text: 'description', metadata: { toClientId, data: desc } });
+        }
+
+        function onSendChannelStateChange(event, toClientId) {
+            console.log("onSendChannelStateChange toClientId", toClientId)
             if (sendChannel) {
                 const { readyState } = sendChannel;
                 console.log('onSendChannelStateChange', readyState)
                 console.log(`Send channel state is: ${readyState}`);
                 if (readyState === 'open') {
-                    // sendData();
+                    sendData(toClientId);
                 }
                 // else if (readyState === 'closed') {
                 // sendFileButton.disabled = true;
                 // abortButton.disabled = true;
                 // }
             }
+        }
+
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        async function sendData(toClientId) {
+            const file = files[0];
+            console.log(`File is ${[file.name, file.size, file.type, file.lastModified].join(' ')}`);
+            send({
+                text: 'file', metadata: {
+                    toClientId,
+                    data: {
+                        name: file.name,
+                        size: file.size,
+                    }
+                }
+            });
+
+            await sleep(500);
+
+            // Handle 0 size files.
+            // statusMessage.textContent = '';
+            // downloadAnchor.textContent = '';
+            if (file.size === 0) {
+                bitrateDiv.innerHTML = '';
+                statusMessage.textContent = 'File is empty, please select a non-empty file';
+                // closeDataChannels();
+                return;
+            }
+            setSendProgressMax(file.size);
+            setReceiveProgressMax(file.size);
+            const chunkSize = 16384;
+            fileReader = new FileReader();
+            let offset = 0;
+            fileReader.addEventListener('error', error => console.error('Error reading file:', error));
+            fileReader.addEventListener('abort', event => console.log('File reading aborted:', event));
+            fileReader.addEventListener('load', e => {
+                console.log('FileRead.onload  ', e);
+
+
+                const send = () => {
+                    while (e.target.result && e.target.result.byteLength) {
+                        if (sendChannel.bufferedAmount > sendChannel.bufferedAmountLowThreshold) {
+                            sendChannel.onbufferedamountlow = () => {
+                                sendChannel.onbufferedamountlow = null;
+                                send();
+                            };
+                            return;
+                        }
+                        //     const chunk = buffer.slice(0, chunkSize);
+                        //     buffer = buffer.slice(chunkSize, buffer.byteLength);
+                        //     dataChannel.send(chunk);
+                        sendChannel.send(e.target.result);
+
+                        offset += e.target.result.byteLength;
+                        sendProgress.value = offset;
+                        if (offset < file.size) {
+                            readSlice(offset);
+                        }
+                    }
+                };
+                send();
+
+
+
+
+            });
+            const readSlice = o => {
+                // console.log('readSlice ', o);
+                const slice = file.slice(offset, o + chunkSize);
+                fileReader.readAsArrayBuffer(slice);
+            };
+            readSlice(0);
         }
 
         return (
@@ -274,9 +386,8 @@ const PresenceListener = ({ client, send, files }) => {
 };
 
 const FileComponent = ({ setFiles }) => {
-    const updateFile = (event) => {
+    const updateFile = (files) => {
 
-        const files = event.currentTarget.files;
         // ファイルがなければ終了
         if (!files || files?.length === 0) return;
 
@@ -290,7 +401,7 @@ const FileComponent = ({ setFiles }) => {
     };
 
     return (
-        <input type='file' onChange={updateFile} />
+        <FileUploader name="file" handleChange={updateFile} multiple />
     );
 }
 
